@@ -13,6 +13,7 @@ import { DribbbleDto } from '@gitroom/nestjs-libraries/dtos/posts/providers-sett
 import { Integration } from '@prisma/client';
 
 export class FacebookProvider extends SocialAbstract implements SocialProvider {
+  private static readonly VIDEO_CHUNK_SIZE = 10 * 1024 * 1024; // 10MB
   identifier = 'facebook';
   name = 'Facebook Page';
   isBetweenSteps = true;
@@ -406,39 +407,221 @@ export class FacebookProvider extends SocialAbstract implements SocialProvider {
     throw new Error('Page not found in your accounts');
   }
 
+  private async downloadVideoBuffer(videoUrl: string): Promise<Buffer> {
+    const response = await fetch(videoUrl);
+    if (!response.ok) {
+      throw new Error('Failed to download video for Facebook upload');
+    }
+
+    const arrayBuffer = await response.arrayBuffer();
+    const buffer = Buffer.from(arrayBuffer);
+
+    if (!buffer.length) {
+      throw new Error('Video is empty, cannot upload to Facebook');
+    }
+
+    return buffer;
+  }
+
+  private async startVideoUploadSession(
+    pageId: string,
+    accessToken: string,
+    fileSize: number
+  ): Promise<{
+    uploadSessionId: string;
+    videoId: string;
+    startOffset: string;
+    endOffset: string;
+  }> {
+    const session = await (
+      await this.fetch(
+        `https://graph.facebook.com/v20.0/${pageId}/videos`,
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({
+            upload_phase: 'start',
+            file_size: fileSize,
+            access_token: accessToken,
+          }),
+        },
+        'facebook-resumable-start'
+      )
+    ).json();
+
+    if (
+      !session?.upload_session_id ||
+      !session?.video_id ||
+      session?.start_offset === undefined ||
+      session?.end_offset === undefined
+    ) {
+      throw new Error('Facebook resumable upload start phase returned invalid response');
+    }
+
+    return {
+      uploadSessionId: session.upload_session_id,
+      videoId: session.video_id,
+      startOffset: session.start_offset,
+      endOffset: session.end_offset,
+    };
+  }
+
+  private async transferVideoChunk(
+    pageId: string,
+    accessToken: string,
+    uploadSessionId: string,
+    startOffset: string,
+    chunk: Buffer
+  ): Promise<{ startOffset: string; endOffset: string }> {
+    const formData = new FormData();
+    formData.append('upload_phase', 'transfer');
+    formData.append('upload_session_id', uploadSessionId);
+    formData.append('start_offset', startOffset);
+    formData.append('access_token', accessToken);
+    formData.append(
+      'video_file_chunk',
+      new Blob([chunk], { type: 'application/octet-stream' }),
+      'chunk.mp4'
+    );
+
+    const transfer = await (
+      await this.fetch(
+        `https://graph.facebook.com/v20.0/${pageId}/videos`,
+        {
+          method: 'POST',
+          body: formData,
+        },
+        'facebook-resumable-transfer'
+      )
+    ).json();
+
+    if (
+      transfer?.start_offset === undefined ||
+      transfer?.end_offset === undefined
+    ) {
+      throw new Error('Facebook resumable upload transfer phase returned invalid response');
+    }
+
+    return {
+      startOffset: transfer.start_offset,
+      endOffset: transfer.end_offset,
+    };
+  }
+
+  private async finishVideoUploadSession(
+    pageId: string,
+    accessToken: string,
+    uploadSessionId: string,
+    message: string
+  ) {
+    await this.fetch(
+      `https://graph.facebook.com/v20.0/${pageId}/videos`,
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          upload_phase: 'finish',
+          upload_session_id: uploadSessionId,
+          description: message,
+          published: true,
+          access_token: accessToken,
+        }),
+      },
+      'facebook-resumable-finish'
+    );
+  }
+
+  private async uploadVideoResumable(
+    pageId: string,
+    accessToken: string,
+    videoUrl: string,
+    message: string
+  ): Promise<{ videoId: string; permalinkUrl: string }> {
+    const videoBuffer = await this.downloadVideoBuffer(videoUrl);
+    const fileSize = videoBuffer.length;
+
+    let { uploadSessionId, videoId, startOffset, endOffset } =
+      await this.startVideoUploadSession(pageId, accessToken, fileSize);
+
+    while (Number(startOffset) < Number(endOffset)) {
+      const previousStartOffset = startOffset;
+      const start = Number(startOffset);
+      const end = Math.min(
+        start + FacebookProvider.VIDEO_CHUNK_SIZE,
+        fileSize,
+        Number(endOffset)
+      );
+      const chunk = videoBuffer.slice(start, end);
+
+      const transfer = await this.transferVideoChunk(
+        pageId,
+        accessToken,
+        uploadSessionId,
+        startOffset,
+        chunk
+      );
+
+      startOffset = transfer.startOffset;
+      endOffset = transfer.endOffset;
+
+      if (startOffset === previousStartOffset) {
+        throw new Error('Facebook resumable upload did not advance chunk offset');
+      }
+    }
+
+    await this.finishVideoUploadSession(
+      pageId,
+      accessToken,
+      uploadSessionId,
+      message
+    );
+
+    let permalinkUrl = `https://www.facebook.com/reel/${videoId}`;
+    try {
+      const permalinkData = await (
+        await this.fetch(
+          `https://graph.facebook.com/v20.0/${videoId}?fields=permalink_url&access_token=${accessToken}`,
+          {},
+          'facebook-video-permalink'
+        )
+      ).json();
+
+      if (permalinkData?.permalink_url) {
+        permalinkUrl = permalinkData.permalink_url;
+      }
+    } catch {
+      // Fallback to reel URL if permalink is not ready yet.
+    }
+
+    return { videoId, permalinkUrl };
+  }
+
   async post(
     id: string,
     accessToken: string,
     postDetails: PostDetails<FacebookDto>[]
   ): Promise<PostResponse[]> {
     const [firstPost] = postDetails;
+    const firstMedia = firstPost?.media?.[0];
+    const isVideo =
+      firstMedia?.type === 'video' ||
+      /\.mp4($|\?)/i.test(firstMedia?.path || '');
 
     let finalId = '';
     let finalUrl = '';
-    if ((firstPost?.media?.[0]?.path?.indexOf('mp4') || -2) > -1) {
-      const {
-        id: videoId,
-        permalink_url,
-        ...all
-      } = await (
-        await this.fetch(
-          `https://graph.facebook.com/v20.0/${id}/videos?access_token=${accessToken}&fields=id,permalink_url`,
-          {
-            method: 'POST',
-            headers: {
-              'Content-Type': 'application/json',
-            },
-            body: JSON.stringify({
-              file_url: firstPost?.media?.[0]?.path!,
-              description: firstPost.message,
-              published: true,
-            }),
-          },
-          'upload mp4'
-        )
-      ).json();
+    if (isVideo && firstMedia?.path) {
+      const { videoId, permalinkUrl } = await this.uploadVideoResumable(
+        id,
+        accessToken,
+        firstMedia.path,
+        firstPost.message
+      );
 
-      finalUrl = 'https://www.facebook.com/reel/' + videoId;
+      finalUrl = permalinkUrl;
       finalId = videoId;
     } else {
       const uploadPhotos = !firstPost?.media?.length
@@ -656,4 +839,3 @@ export class FacebookProvider extends SocialAbstract implements SocialProvider {
     }
   }
 }
-
